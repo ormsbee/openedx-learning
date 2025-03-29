@@ -42,7 +42,7 @@ class DraftChangeLogContext(Atomic):
     """
     _draft_change_logs: ContextVar[list | None] = ContextVar('_draft_change_logs', default=None)
     
-    def __init__(self, learning_package_id, changed_by=None, changed_at=None, exit_callbacks=None):
+    def __init__(self, learning_package_id, changed_at=None, changed_by=None, exit_callbacks=None):
         super().__init__(using=None, savepoint=False, durable=False)
 
         self.learning_package_id = learning_package_id

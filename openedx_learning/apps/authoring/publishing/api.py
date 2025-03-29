@@ -6,6 +6,7 @@ are stored in this app.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TypeVar
@@ -440,12 +441,16 @@ def get_published_version(publishable_entity_id: int, /) -> PublishableEntityVer
     return published.version
 
 
+
+# Refactor (extract) the one that takes a Draft to a different function
 def set_draft_version(
     publishable_entity_id: int,
     publishable_entity_version_pk: int | None,
     /,
     set_at: datetime | None = None,
     set_by: int | None = None,  # User.id
+    draft: Draft | None = None,  # optional, if we already have the Draft
+    create_transaction: bool = True,
 ) -> None:
     """
     Modify the Draft of a PublishableEntity to be a PublishableEntityVersion.
@@ -462,9 +467,13 @@ def set_draft_version(
     """
     if set_at is None:
         set_at = datetime.now(tz=timezone.utc)
+    
+    tx_context = atomic() if create_transaction else nullcontext()
 
-    with atomic():
-        draft, _created = Draft.objects.select_related("entity").get_or_create(entity_id=publishable_entity_id)
+    with tx_context:
+        if draft is None:
+            draft, _created = Draft.objects.select_related("entity") \
+                                           .get_or_create(entity_id=publishable_entity_id)
         old_version_id = draft.version_id
         draft.version_id = publishable_entity_version_pk
         draft.save()
@@ -545,17 +554,17 @@ def _add_to_existing_draft_change_log(
 
 
 def _create_container_side_effects_for_draft_change_log(change_log: DraftChangeLogRecord):
-    seen_container_pks = set()
+    processed_entity_ids = set()
     for change in change_log.changes.all():
         _create_container_side_effects_for_draft_change(
             change,
-            already_processed_containers_pks=seen_container_pks,
+            processed_entity_ids=processed_entity_ids,
         )
 
 
 def _create_container_side_effects_for_draft_change(
     original_change: DraftChangeLogRecord,
-    already_processed_containers_pks=None
+    processed_entity_ids: set | None = None
 ):
     """
     Given a draft change, add side effects for all affected containers.
@@ -568,10 +577,8 @@ def _create_container_side_effects_for_draft_change(
     TODO: This could get very expensive with the get_containers_with_entity
     calls. We should measure the impact of this.
     """
-    if already_processed_containers_pks is not None:
-        seen_container_pks = already_processed_containers_pks
-    else:
-        seen_container_pks = set()
+    if processed_entity_ids is None:
+        processed_entity_ids = set()
 
     changes_and_containers = [
         (original_change, container)
@@ -580,11 +587,6 @@ def _create_container_side_effects_for_draft_change(
     ]
     while changes_and_containers:
         change, container = changes_and_containers.pop()
-        # If we've already seen this container, no need to handle it again.
-        # This also guards against infinite cycle chains of containers.
-        if container.pk in seen_container_pks:
-            continue
-        seen_container_pks.add(container.pk)
 
         # If the container is not already in the DraftChangeLog, we need to
         # add it. Since it's being caused as a DraftSideEffect, we're going
@@ -606,6 +608,7 @@ def _create_container_side_effects_for_draft_change(
         # in both ways (the Unit's internal metadata as well as the new version
         # of the child component).
         DraftSideEffect.objects.get_or_create(cause=change, effect=container_change)
+        processed_entity_ids.add(change.entity_id)
 
         # Now we find the next layer up of containers. So if the originally
         # passed in publishable_entity_id was for a Component, then the
@@ -613,9 +616,11 @@ def _create_container_side_effects_for_draft_change(
         # is the Unit, and ``parents_of_container`` would be any Sequences
         # that contain the Unit.
         parents_of_container = get_containers_with_entity(container.pk, ignore_pinned=True)
+
         changes_and_containers.extend(
             (container_change, container_parent)
             for container_parent in parents_of_container
+            if container_parent.pk not in processed_entity_ids
         )
 
 def soft_delete_draft(publishable_entity_id: int, /, deleted_by: int | None = None) -> None:
@@ -687,60 +692,35 @@ def reset_drafts_to_published(
     if not draft_qset:
         return
 
-    # Note: We can't do an .update with a F() on a joined field in the ORM, so
-    # we have to loop through the drafts individually to reset them. We can
-    # rework this into a bulk update or custom SQL if it becomes a performance
-    # issue.
-    with atomic():
-        active_change_log = DraftChangeLogContext.get_active_draft_change_log(learning_package_id)
-        change_log = active_change_log or DraftChangeLog.objects.create(
-            learning_package_id=learning_package_id,
-            changed_at=reset_at,
-            changed_by_id=reset_by,
+    active_change_log = DraftChangeLogContext.get_active_draft_change_log(learning_package_id)
+
+    # If there's an active DraftChangeLog, we're already in a transaction, so
+    # there's no need to open a new one.
+    if active_change_log:
+        tx_context = nullcontext()
+    else:
+        tx_context = bulk_draft_changes_for(
+            learning_package_id, changed_at=reset_at, changed_by=reset_by
         )
 
+    with tx_context:
+        # Note: We can't do an .update with a F() on a joined field in the ORM,
+        # so we have to loop through the drafts individually to reset them
+        # anyhow. We can rework this into a bulk update or custom SQL if it
+        # becomes a performance issue, as long as we also port over the
+        # bookkeeping code in set_draft_version.
         for draft in draft_qset:
             if hasattr(draft.entity, 'published'):
                 published_version_id = draft.entity.published.version_id
             else:
                 published_version_id = None
 
-            if active_change_log:
-                # We're inside a draft_changes_for() context call and we need to
-                # attach our DraftChanges to an existing DraftChangeLog.
-                try:
-                    # If there was already a DraftChange for this publishable
-                    # entity, we update the new_version_id. We keep the
-                    # old_version_id value though, because that represents what
-                    # it was before this DraftChangeLog.
-                    change = DraftChangeLogRecord.objects.get(
-                        draft_change_log=active_change_log,
-                        entity_id=draft.entity_id,
-                    )
-                    change.new_version_id = published_version_id
-                    change.save()
-                except DraftChangeLogRecord.DoesNotExist:
-                    # If we're here, this is the first DraftChange we're making for this
-                    # PublishableEntity in this DraftChangeLog. 
-                    DraftChangeLogRecord.objects.create(
-                        draft_change_log=active_change_log,
-                        entity_id=draft.entity_id,
-                        old_version_id=draft.version_id,
-                        new_version_id=published_version_id,
-                    )
-            else:
-                DraftChangeLogRecord.objects.create(
-                    draft_change_log=change_log,
-                    entity_id=draft.entity_id,
-                    old_version_id=draft.version_id,
-                    new_version_id=published_version_id,
-                )
-
-            # Now that we're done with our change set bookkeeping, modify the
-            # actual Draft's version_id to point to the published version.
-            draft.version_id = published_version_id
-            draft.save()
-
+            set_draft_version(
+                draft.entity_id,
+                published_version_id,
+                draft=draft,
+                create_transaction=False,
+            )
 
 def register_content_models(
     content_model_cls: type[PublishableEntityMixin],
@@ -1207,8 +1187,8 @@ def bulk_draft_changes_for(learning_package_id: int, changed_by=None, changed_at
     """
     return DraftChangeLogContext(
         learning_package_id,
-        changed_by=changed_by,
         changed_at=changed_at,
+        changed_by=changed_by,
         exit_callbacks=[
             _create_container_side_effects_for_draft_change_log,
         ]
