@@ -444,12 +444,11 @@ def get_published_version(publishable_entity_id: int, /) -> PublishableEntityVer
 
 # Refactor (extract) the one that takes a Draft to a different function
 def set_draft_version(
-    publishable_entity_id: int,
+    publishable_entity_id_or_draft: int | Draft,
     publishable_entity_version_pk: int | None,
     /,
     set_at: datetime | None = None,
     set_by: int | None = None,  # User.id
-    draft: Draft | None = None,  # optional, if we already have the Draft
     create_transaction: bool = True,
 ) -> None:
     """
@@ -471,9 +470,11 @@ def set_draft_version(
     tx_context = atomic() if create_transaction else nullcontext()
 
     with tx_context:
-        if draft is None:
+        if isinstance(publishable_entity_id_or_draft, Draft):
+            draft = publishable_entity_id_or_draft
+        else:
             draft, _created = Draft.objects.select_related("entity") \
-                                           .get_or_create(entity_id=publishable_entity_id)
+                                           .get_or_create(entity_id=publishable_entity_id_or_draft)
         old_version_id = draft.version_id
         draft.version_id = publishable_entity_version_pk
         draft.save()
@@ -493,7 +494,7 @@ def set_draft_version(
         if active_change_log:
             change = _add_to_existing_draft_change_log(
                 active_change_log,
-                publishable_entity_id,
+                draft.entity_id,
                 old_version_id=old_version_id,
                 new_version_id=publishable_entity_version_pk,
             )
@@ -512,7 +513,7 @@ def set_draft_version(
             # we're creating the whole DraftChangeLog right here.
             change = DraftChangeLogRecord.objects.create(
                 draft_change_log=change_log,
-                entity_id=publishable_entity_id,
+                entity_id=draft.entity_id,
                 old_version_id=old_version_id,
                 new_version_id=publishable_entity_version_pk,
             )    
@@ -715,12 +716,7 @@ def reset_drafts_to_published(
             else:
                 published_version_id = None
 
-            set_draft_version(
-                draft.entity_id,
-                published_version_id,
-                draft=draft,
-                create_transaction=False,
-            )
+            set_draft_version(draft, published_version_id, create_transaction=False)
 
 def register_content_models(
     content_model_cls: type[PublishableEntityMixin],
