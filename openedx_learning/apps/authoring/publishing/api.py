@@ -34,6 +34,7 @@ from .models import (
     PublishableEntityVersionMixin,
     PublishLog,
     PublishLogRecord,
+    PublishSideEffect,
 )
 from .models.publish_log import Published
 
@@ -548,7 +549,7 @@ def set_draft_version(
                 old_version_id=old_version_id,
                 new_version_id=publishable_entity_version_pk,
             )
-            _create_container_side_effects_for_draft_change(change)
+            _create_container_side_effects_for_change_record(change)
 
 
 def _add_to_existing_draft_change_log(
@@ -614,24 +615,24 @@ def _add_to_existing_draft_change_log(
     return change
 
 
-def _create_container_side_effects_for_draft_change_log(change_log: DraftChangeLog):
+def _create_container_side_effects_for_log(log: DraftChangeLog | PublishLog):
     """
-    Iterate through the whole DraftChangeLog and process side-effects.
+    Iterate through a DraftChangeLog or PublishLog and process side-effects.
     """
     processed_entity_ids: set[int] = set()
-    for change in change_log.records.all():
-        _create_container_side_effects_for_draft_change(
-            change,
+    for change_record in log.records.all():
+        _create_container_side_effects_for_change_record(
+            change_record,
             processed_entity_ids=processed_entity_ids,
         )
 
 
-def _create_container_side_effects_for_draft_change(
-    original_change: DraftChangeLogRecord,
+def _create_container_side_effects_for_change_record(
+    original_change: DraftChangeLogRecord | PublishLogRecord,
     processed_entity_ids: set | None = None
 ):
     """
-    Given a draft change, add side effects for all affected containers.
+    Given a change record, add side effects for all affected containers.
 
     This should only be run after the DraftChangeLogRecord has been otherwise
     fully written out. We want to avoid the scenario where we create a
@@ -648,6 +649,19 @@ def _create_container_side_effects_for_draft_change(
     TODO: This could get very expensive with the get_containers_with_entity
     calls. We should measure the impact of this.
     """
+    if isinstance(original_change, DraftChangeLogRecord):
+        side_effect_model_class = DraftSideEffect
+        search_published_containers = False
+    elif isinstance(original_change, PublishLogRecord):
+        side_effect_model_class = PublishSideEffect
+        search_published_containers = True
+    else:
+        raise TypeError(
+            f"{original_change!r} must be of type DraftChangeLogRecord or "
+            f"PublishLogRecord, not {type(original_change)}."
+        )
+    record_class = type(original_change)
+
     if processed_entity_ids is None:
         # An optimization, but also a guard against infinite side-effect loops.
         processed_entity_ids = set()
@@ -655,7 +669,11 @@ def _create_container_side_effects_for_draft_change(
     changes_and_containers = [
         (original_change, container)
         for container
-        in get_containers_with_entity(original_change.entity_id, ignore_pinned=True)
+        in get_containers_with_entity(
+            original_change.entity_id,
+            ignore_pinned=True,
+            published=search_published_containers,
+        )
     ]
     while changes_and_containers:
         change, container = changes_and_containers.pop()
@@ -664,7 +682,7 @@ def _create_container_side_effects_for_draft_change(
         # add it. Since it's being caused as a DraftSideEffect, we're going
         # add it with the old_version == new_version convention.
         container_draft_version_pk = container.versioning.draft.pk
-        container_change, _created = DraftChangeLogRecord.objects.get_or_create(
+        container_change, _created = record_class.objects.get_or_create(
             draft_change_log=change.draft_change_log,
             entity_id=container.pk,
             defaults={
@@ -679,7 +697,7 @@ def _create_container_side_effects_for_draft_change(
         # both the Unit and Component have their versions incremented, then the
         # Unit has changed in both ways (the Unit's internal metadata as well as
         # the new version of the child component).
-        DraftSideEffect.objects.get_or_create(cause=change, effect=container_change)
+        side_effect_class.objects.get_or_create(cause=change, effect=container_change)
         processed_entity_ids.add(change.entity_id)
 
         # Now we find the next layer up of containers. So if the originally
@@ -687,7 +705,11 @@ def _create_container_side_effects_for_draft_change(
         # ``container`` we've been creating the side effect for in this loop
         # is the Unit, and ``parents_of_container`` would be any Sequences
         # that contain the Unit.
-        parents_of_container = get_containers_with_entity(container.pk, ignore_pinned=True)
+        parents_of_container = get_containers_with_entity(
+            container.pk,
+            ignore_pinned=True,
+            published=search_published_containers,
+        )
 
         changes_and_containers.extend(
             (container_change, container_parent)
@@ -1354,6 +1376,7 @@ def get_containers_with_entity(
     publishable_entity_pk: int,
     *,
     ignore_pinned=False,
+    published=False,
 ) -> QuerySet[Container]:
     """
     [ 🛑 UNSTABLE ]
@@ -1366,24 +1389,39 @@ def get_containers_with_entity(
         publishable_entity_pk: The ID of the PublishableEntity to search for.
         ignore_pinned: if true, ignore any pinned references to the entity.
     """
+    relation_model = "published" if published else "draft"
+
     if ignore_pinned:
         # TODO: Do we need to run distinct() on this? Will fix in https://github.com/openedx/openedx-learning/issues/303
-        qs = Container.objects.filter(
-            # Note: these two conditions must be in the same filter() call, or the query won't be correct.
-            publishable_entity__draft__version__containerversion__entity_list__entitylistrow__entity_id=publishable_entity_pk,  # pylint: disable=line-too-long # noqa: E501
-            publishable_entity__draft__version__containerversion__entity_list__entitylistrow__entity_version_id=None,  # pylint: disable=line-too-long # noqa: E501
-        ).order_by("pk")  # Ordering is mostly for consistent test cases.
+        filter_dict = {
+            # Note: these two conditions must be in the same filter() call,
+            # or the query won't be correct.
+            (
+                f"publishable_entity__{relation_model}__version__"
+                "containerversion__entity_list__entitylistrow__entity_id"
+            ): publishable_entity_pk,
+            (
+                f"publishable_entity__{relation_model}__version__"
+                "containerversion__entity_list__entitylistrow__entity_version_id"
+            ): None,
+        }
+        qs = Container.objects.filter(**filter_dict)
     else:
-        qs = Container.objects.filter(
-            publishable_entity__draft__version__containerversion__entity_list__entitylistrow__entity_id=publishable_entity_pk,  # pylint: disable=line-too-long # noqa: E501
-        ).order_by("pk")  # Ordering is mostly for consistent test cases.
+        filter_dict = {
+            (
+                f"publishable_entity__{relation_model}__version__"
+                "containerversion__entity_list__entitylistrow__entity_id"
+            ): publishable_entity_pk
+        }
+        qs = Container.objects.filter(**filter_dict)
+
     # Could alternately do this query in two steps. Not sure which is more efficient; depends on how the DB plans it.
     # # Find all the EntityLists that contain the given entity:
     # lists = EntityList.objects.filter(entitylistrow__entity_id=publishable_entity_pk).values_list('pk', flat=True)
     # qs = Container.objects.filter(
     #     publishable_entity__draft__version__containerversion__entity_list__in=lists
     # )
-    return qs
+    return qs.order_by("pk").distinct()  # Ordering is mostly for consistent test cases.
 
 
 def get_container_children_count(
@@ -1451,6 +1489,6 @@ def bulk_draft_changes_for(
         changed_at=changed_at,
         changed_by=changed_by,
         exit_callbacks=[
-            _create_container_side_effects_for_draft_change_log,
+            _create_container_side_effects_for_log,
         ]
     )
