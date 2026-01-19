@@ -104,7 +104,7 @@ stevedore==5.6.0
     # via
     #   edx-django-utils
     #   edx-opaque-keys
-tomlkit==0.13.3
+tomlkit==0.14.0
     # via -r requirements/base.in
 typing-extensions==4.15.0
     # via edx-opaque-keys
