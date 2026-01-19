@@ -155,7 +155,7 @@ djangorestframework==3.16.1
     #   -r requirements/quality.txt
     #   drf-jwt
     #   edx-drf-extensions
-djangorestframework-stubs==3.16.6
+djangorestframework-stubs==3.16.7
     # via -r requirements/quality.txt
 dnspython==2.8.0
     # via
@@ -223,7 +223,7 @@ jaraco-classes==3.4.0
     # via
     #   -r requirements/quality.txt
     #   keyring
-jaraco-context==6.0.2
+jaraco-context==6.1.0
     # via
     #   -r requirements/quality.txt
     #   keyring
@@ -249,7 +249,7 @@ kombu==5.6.2
     # via
     #   -r requirements/quality.txt
     #   celery
-librt==0.7.7
+librt==0.7.8
     # via
     #   -r requirements/quality.txt
     #   mypy
@@ -428,7 +428,6 @@ readme-renderer==44.0
 requests==2.32.5
     # via
     #   -r requirements/quality.txt
-    #   djangorestframework-stubs
     #   edx-drf-extensions
     #   id
     #   requests-toolbelt
@@ -481,7 +480,7 @@ text-unidecode==1.3
     # via
     #   -r requirements/quality.txt
     #   python-slugify
-tomlkit==0.13.3
+tomlkit==0.14.0
     # via
     #   -r requirements/quality.txt
     #   pylint
